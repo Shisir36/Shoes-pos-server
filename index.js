@@ -1,4 +1,3 @@
-// ✅ Updated Backend with Smart Merge Logic for Shoe POS System
 const express = require("express");
 const cors = require("cors");
 const app = express();
@@ -25,8 +24,7 @@ async function run() {
     await client.connect();
     const db = client.db("Shoes-shop-pos");
     const shoesCollection = db.collection("shoes");
-
-    // ✅ FULL BACKEND FIX WITH MULTIPLE BARCODE GENERATION
+    const salesCollection = db.collection("sales"); // <==== declared here
 
     // POST: Add Shoes
     app.post("/api/shoes/add", async (req, res) => {
@@ -82,7 +80,6 @@ async function run() {
             insertedCount++;
           }
 
-          // ✅ Generate individual barcodes for each pair
           for (let i = 0; i < quantity; i++) {
             const timestamp = Date.now();
             addedShoes.push({
@@ -108,11 +105,12 @@ async function run() {
       }
     });
 
-    // ✅ GET: Grouped Stock
+    // GET: Grouped Shoes stock
     app.get("/api/shoes", async (req, res) => {
       try {
         const groupedShoes = await shoesCollection
           .aggregate([
+            { $sort: { createdAt: -1 } }, // So $first gives latest
             {
               $group: {
                 _id: {
@@ -124,12 +122,13 @@ async function run() {
                   pricePerPair: "$pricePerPair",
                 },
                 quantity: { $sum: "$quantity" },
-                createdAt: { $max: "$createdAt" },
+                createdAt: { $first: "$createdAt" },
+                anyId: { $first: "$_id" }, // Latest ID now
               },
             },
             {
               $project: {
-                _id: 0,
+                _id: "$anyId", // You send this to frontend for future updates
                 shoeName: "$_id.shoeName",
                 brand: "$_id.brand",
                 articleNumber: "$_id.articleNumber",
@@ -140,27 +139,97 @@ async function run() {
                 createdAt: 1,
               },
             },
-            { $sort: { createdAt: -1 } },
           ])
           .toArray();
 
         res.json(groupedShoes);
       } catch (err) {
         console.error(err);
-        res.status(500).json({ message: "Error fetching grouped stock data" });
+        res.status(500).json({ message: "Error fetching grouped stock" });
       }
     });
-    app.get("/api/shoes/barcode/:code", async (req, res) => {
-      const code = req.params.code;
-      const baseBarcode = code.split("-").slice(0, 4).join("-"); // safely extract up to size
+    app.get("/api/shoes/:id", async (req, res) => {
+      const { id } = req.params;
+
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({ message: "Invalid shoe ID" });
+      }
 
       try {
-        const result = await db
-          .collection("shoes")
-          .findOne({ barcode: baseBarcode });
+        const shoe = await shoesCollection.findOne({ _id: new ObjectId(id) });
+        if (!shoe) {
+          return res.status(404).json({ message: "Shoe not found" });
+        }
+        res.json(shoe);
+      } catch (err) {
+        console.error("Failed to fetch shoe:", err);
+        res.status(500).json({ message: "Server error" });
+      }
+    });
 
+    // PUT update shoe by ID
+    app.put("/api/shoes/:id", async (req, res) => {
+      const { id } = req.params;
+      const {
+        shoeName,
+        brand,
+        articleNumber,
+        color,
+        size,
+        quantity,
+        pricePerPair,
+      } = req.body;
+
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({ message: "Invalid shoe ID" });
+      }
+
+      // Basic validation (you can add more)
+      if (
+        !shoeName ||
+        !brand ||
+        !articleNumber ||
+        !color ||
+        !size ||
+        quantity === undefined ||
+        !pricePerPair
+      ) {
+        return res.status(400).json({ message: "Missing required fields" });
+      }
+
+      try {
+        const updated = await shoesCollection.findOneAndUpdate(
+          { _id: new ObjectId(id) },
+          {
+            $set: {
+              shoeName,
+              brand,
+              articleNumber,
+              color,
+              size: Number(size),
+              quantity: Number(quantity),
+              pricePerPair: Number(pricePerPair),
+            },
+          },
+          { returnDocument: "after" } // Returns the updated document
+        );
+
+        if (!updated.value) {
+          return res.status(404).json({ message: "Shoe not found" });
+        }
+
+        res.json({ message: "Shoe updated successfully", shoe: updated.value });
+      } catch (err) {
+        console.error("Failed to update shoe:", err);
+        res.status(500).json({ message: "Server error" });
+      }
+    });
+    // GET by barcode
+    app.get("/api/shoes/barcode/:code", async (req, res) => {
+      const baseBarcode = req.params.code.split("-").slice(0, 4).join("-");
+      try {
+        const result = await shoesCollection.findOne({ barcode: baseBarcode });
         if (!result) return res.status(404).json({ message: "Not found" });
-
         res.json({
           shoeName: result.shoeName,
           color: result.color,
@@ -175,55 +244,28 @@ async function run() {
         res.status(500).json({ message: "Server error" });
       }
     });
-    app.get("/api/sales/:id", async (req, res) => {
-      try {
-        const saleId = req.params.id;
-        console.log(saleId);
-        if (!ObjectId.isValid(saleId)) {
-          return res.status(400).json({ message: "Invalid sale ID" });
-        }
 
-        // Find sale by _id
-        const sale = await db
-          .collection("sales")
-          .findOne({ _id: new ObjectId(saleId) });
-
-        if (!sale) {
-          return res.status(404).json({ message: "Sale not found" });
-        }
-
-        res.json(sale);
-      } catch (err) {
-        console.error(err);
-        res.status(500).json({ message: "Failed to fetch sale data" });
-      }
-    });
-    // POST: Sell shoe
+    // POST: Sell shoes - Create sale + update stock
     app.post("/api/sell", async (req, res) => {
       try {
         const { cart } = req.body;
-
-        if (!Array.isArray(cart) || cart.length === 0) {
+        if (!Array.isArray(cart) || cart.length === 0)
           return res.status(400).json({ message: "Cart is empty" });
-        }
 
-        // Check stock and prepare update operations and sale items
         const bulkUpdate = [];
         const saleItems = [];
 
         for (const item of cart) {
           const { barcode, qty, price, discount = 0 } = item;
-
-          if (!barcode || !qty || !price) {
+          if (!barcode || !qty || !price)
             return res.status(400).json({ message: "Invalid cart item data" });
-          }
 
           const existing = await shoesCollection.findOne({ barcode });
-          if (!existing || existing.quantity < qty) {
+
+          if (!existing || existing.quantity < qty)
             return res.status(400).json({
               message: `Insufficient stock or product not found for barcode: ${barcode}`,
             });
-          }
 
           bulkUpdate.push({
             updateOne: {
@@ -251,93 +293,108 @@ async function run() {
           });
         }
 
-        // Bulk update stock
-        if (bulkUpdate.length > 0) {
-          await shoesCollection.bulkWrite(bulkUpdate);
-        }
+        if (bulkUpdate.length > 0) await shoesCollection.bulkWrite(bulkUpdate);
 
-        // Insert one sale document for the whole transaction
-        const saleDoc = {
-          items: saleItems,
-          soldAt: new Date(),
-        };
+        const saleDoc = { items: saleItems, soldAt: new Date() };
+        const result = await salesCollection.insertOne(saleDoc);
 
-        const result = await db.collection("sales").insertOne(saleDoc);
-
-        res.status(200).json({
-          message: "Sale completed successfully",
-          saleId: result.insertedId, // send back the sale document id
-        });
+        res.json({ message: "Sale completed", saleId: result.insertedId });
       } catch (err) {
         console.error(err);
         res.status(500).json({ message: "Sale failed" });
       }
     });
 
+    // GET all sales
     app.get("/api/sales", async (req, res) => {
       try {
-        const sales = await db
-          .collection("sales")
+        const sales = await salesCollection
           .find()
           .sort({ soldAt: -1 })
           .toArray();
-
         res.json(sales);
       } catch (err) {
-        console.error("Error fetching sales:", err);
+        console.error(err);
         res.status(500).json({ message: "Failed to fetch sales" });
       }
     });
-    // Update sale item inside a sale document
+
+    // GET sale by ID
     app.get("/api/sales/:id", async (req, res) => {
       const { id } = req.params;
-
-      if (!ObjectId.isValid(id)) {
+      if (!ObjectId.isValid(id))
         return res.status(400).json({ message: "Invalid sale ID" });
-      }
 
       try {
-        const sale = await db
-          .collection("sales")
-          .findOne({ _id: new ObjectId(id) });
-
-        if (!sale) {
-          return res.status(404).json({ message: "Sale not found" });
-        }
-
+        const sale = await salesCollection.findOne({ _id: new ObjectId(id) });
+        if (!sale) return res.status(404).json({ message: "Sale not found" });
         res.json(sale);
-      } catch (error) {
-        console.error("Error fetching sale:", error);
+      } catch (err) {
+        console.error(err);
         res.status(500).json({ message: "Failed to fetch sale" });
       }
     });
 
-    // Sale এর item আপডেট করার জন্য PATCH route
+    // PUT update sale items (replace all items)
+    app.put("/api/sales/:saleId", async (req, res) => {
+      const { saleId } = req.params;
+      const { items } = req.body;
+      if (!ObjectId.isValid(saleId))
+        return res.status(400).json({ message: "Invalid sale ID" });
+
+      if (!Array.isArray(items) || items.length === 0)
+        return res.status(400).json({ message: "Items array required" });
+
+      try {
+        const updatedItems = items.map((item) => {
+          const quantity = Number(item.quantity || 0);
+          const sellPrice = Number(item.sellPrice || 0);
+          const discount = Number(item.discount || 0);
+          return {
+            ...item,
+            quantity,
+            sellPrice,
+            discount,
+            totalAmount: quantity * sellPrice - discount,
+          };
+        });
+
+        const result = await salesCollection.updateOne(
+          { _id: new ObjectId(saleId) },
+          { $set: { items: updatedItems } }
+        );
+
+        if (result.modifiedCount === 0)
+          return res.status(404).json({ message: "Sale not updated" });
+
+        res.json({ message: "Sale updated successfully", updatedItems });
+      } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: "Failed to update sale" });
+      }
+    });
+
+    // PATCH update sale item (specific item index)
     app.patch("/api/sales/:saleId/item/:itemIndex", async (req, res) => {
       const { saleId, itemIndex } = req.params;
       const { quantity, sellPrice, discount } = req.body;
 
-      if (!ObjectId.isValid(saleId)) {
+      if (!ObjectId.isValid(saleId))
         return res.status(400).json({ message: "Invalid sale ID" });
-      }
 
       const idx = parseInt(itemIndex);
-      if (isNaN(idx)) {
+      if (isNaN(idx))
         return res.status(400).json({ message: "Invalid item index" });
-      }
 
       try {
-        const sale = await db
-          .collection("sales")
-          .findOne({ _id: new ObjectId(saleId) });
-
+        const sale = await salesCollection.findOne({
+          _id: new ObjectId(saleId),
+        });
         if (!sale) return res.status(404).json({ message: "Sale not found" });
 
-        if (!sale.items || !sale.items[idx]) {
+        if (!sale.items || !sale.items[idx])
           return res.status(404).json({ message: "Sale item not found" });
-        }
 
-        // আপডেটেড আইটেম
         const updatedItem = {
           ...sale.items[idx],
           quantity: quantity ?? sale.items[idx].quantity,
@@ -348,16 +405,12 @@ async function run() {
         updatedItem.totalAmount =
           updatedItem.quantity * updatedItem.sellPrice - updatedItem.discount;
 
-        // আইটেম পরিবর্তন
         sale.items[idx] = updatedItem;
 
-        // ডাটাবেজে আপডেট
-        await db
-          .collection("sales")
-          .updateOne(
-            { _id: new ObjectId(saleId) },
-            { $set: { items: sale.items } }
-          );
+        await salesCollection.updateOne(
+          { _id: new ObjectId(saleId) },
+          { $set: { items: sale.items } }
+        );
 
         res.json({ message: "Sale item updated successfully", updatedItem });
       } catch (err) {
@@ -365,18 +418,19 @@ async function run() {
         res.status(500).json({ message: "Failed to update sale item" });
       }
     });
+
     app.get("/", (req, res) => {
       res.send("Shoe POS Backend is running 🚀");
     });
 
     app.listen(port, () => {
-      console.log(`✅ Server is running on port ${port}`);
+      console.log(`✅ Server running on port ${port}`);
     });
 
     await client.db("admin").command({ ping: 1 });
     console.log("✅ Successfully connected to MongoDB!");
-  } catch (error) {
-    console.error("❌ Failed to connect to MongoDB", error);
+  } catch (err) {
+    console.error("❌ Failed to connect to MongoDB", err);
   }
 }
 
