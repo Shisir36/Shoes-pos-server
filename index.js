@@ -25,7 +25,35 @@ async function run() {
     const db = client.db("Shoes-shop-pos");
     const shoesCollection = db.collection("shoes");
     const salesCollection = db.collection("sales"); // <==== declared here
+    // add user
+    app.post("/api/users", async (req, res) => {
+      const { name, email, photo, role } = req.body;
 
+      try {
+        const existingUser = await db.collection("users").findOne({ email });
+        if (existingUser) {
+          return res.status(200).json({ message: "User already exists" });
+        }
+
+        const result = await db.collection("users").insertOne({
+          name,
+          email,
+          photo,
+          role,
+          createdAt: new Date(),
+        });
+
+        res
+          .status(201)
+          .json({ message: "User saved", insertedId: result.insertedId });
+      } catch (error) {
+        res.status(500).json({ error: "Something went wrong" });
+      }
+    });
+
+    app.listen(port, () => {
+      console.log(`🚀 Server running on http://localhost:${port}`);
+    });
     // POST: Add Shoes
     app.post("/api/shoes/add", async (req, res) => {
       try {
@@ -110,7 +138,7 @@ async function run() {
       try {
         const groupedShoes = await shoesCollection
           .aggregate([
-            { $sort: { createdAt: -1 } }, // So $first gives latest
+            { $sort: { createdAt: -1 } }, // Step 1: Sort by createdAt descending
             {
               $group: {
                 _id: {
@@ -122,13 +150,13 @@ async function run() {
                   pricePerPair: "$pricePerPair",
                 },
                 quantity: { $sum: "$quantity" },
-                createdAt: { $first: "$createdAt" },
-                anyId: { $first: "$_id" }, // Latest ID now
+                createdAt: { $first: "$createdAt" }, // Save latest createdAt
+                anyId: { $first: "$_id" },
               },
             },
             {
               $project: {
-                _id: "$anyId", // You send this to frontend for future updates
+                _id: "$anyId",
                 shoeName: "$_id.shoeName",
                 brand: "$_id.brand",
                 articleNumber: "$_id.articleNumber",
@@ -139,6 +167,7 @@ async function run() {
                 createdAt: 1,
               },
             },
+            { $sort: { createdAt: -1 } }, // ✅ Step 2: Final sort after grouping
           ])
           .toArray();
 
@@ -150,7 +179,7 @@ async function run() {
     });
     app.get("/api/shoes/:id", async (req, res) => {
       const { id } = req.params;
-
+      console.log(id);
       if (!ObjectId.isValid(id)) {
         return res.status(400).json({ message: "Invalid shoe ID" });
       }
@@ -166,64 +195,25 @@ async function run() {
         res.status(500).json({ message: "Server error" });
       }
     });
-
-    // PUT update shoe by ID
     app.put("/api/shoes/:id", async (req, res) => {
-      const { id } = req.params;
-      const {
-        shoeName,
-        brand,
-        articleNumber,
-        color,
-        size,
-        quantity,
-        pricePerPair,
-      } = req.body;
-
-      if (!ObjectId.isValid(id)) {
-        return res.status(400).json({ message: "Invalid shoe ID" });
-      }
-
-      // Basic validation (you can add more)
-      if (
-        !shoeName ||
-        !brand ||
-        !articleNumber ||
-        !color ||
-        !size ||
-        quantity === undefined ||
-        !pricePerPair
-      ) {
-        return res.status(400).json({ message: "Missing required fields" });
-      }
-
       try {
-        const updated = await shoesCollection.findOneAndUpdate(
+        const id = req.params.id;
+        const update = req.body;
+
+        const result = await shoesCollection.updateOne(
           { _id: new ObjectId(id) },
-          {
-            $set: {
-              shoeName,
-              brand,
-              articleNumber,
-              color,
-              size: Number(size),
-              quantity: Number(quantity),
-              pricePerPair: Number(pricePerPair),
-            },
-          },
-          { returnDocument: "after" } // Returns the updated document
+          { $set: update }
         );
 
-        if (!updated.value) {
-          return res.status(404).json({ message: "Shoe not found" });
-        }
+        if (result.modifiedCount === 0)
+          return res.status(400).send({ error: "No shoe updated" });
 
-        res.json({ message: "Shoe updated successfully", shoe: updated.value });
-      } catch (err) {
-        console.error("Failed to update shoe:", err);
-        res.status(500).json({ message: "Server error" });
+        res.send({ message: "Shoe updated successfully" });
+      } catch (error) {
+        res.status(500).send({ error: "Update failed" });
       }
     });
+
     // GET by barcode
     app.get("/api/shoes/barcode/:code", async (req, res) => {
       const baseBarcode = req.params.code.split("-").slice(0, 4).join("-");
@@ -295,7 +285,12 @@ async function run() {
 
         if (bulkUpdate.length > 0) await shoesCollection.bulkWrite(bulkUpdate);
 
-        const saleDoc = { items: saleItems, soldAt: new Date() };
+        // Save sale with BD timezone date
+        const bdTime = new Date(
+          new Date().toLocaleString("en-US", { timeZone: "Asia/Dhaka" })
+        );
+
+        const saleDoc = { items: saleItems, soldAt: bdTime };
         const result = await salesCollection.insertOne(saleDoc);
 
         res.json({ message: "Sale completed", saleId: result.insertedId });
@@ -305,16 +300,37 @@ async function run() {
       }
     });
 
-    // GET all sales
+    // Fetch sales with optional date filtering
     app.get("/api/sales", async (req, res) => {
       try {
+        const { from, to } = req.query;
+        const filter = {};
+
+        if (from && to) {
+          const fromDate = new Date(from + "T00:00:00+06:00");
+          const toDate = new Date(to + "T23:59:59+06:00");
+          if (!isNaN(fromDate) && !isNaN(toDate)) {
+            filter.soldAt = { $gte: fromDate, $lte: toDate };
+          }
+        }
+
         const sales = await salesCollection
-          .find()
+          .find(filter)
           .sort({ soldAt: -1 })
           .toArray();
-        res.json(sales);
+
+        // Calculate totalAmount from all sales items
+        const totalAmount = sales.reduce((acc, sale) => {
+          const saleTotal = sale.items.reduce(
+            (sum, item) => sum + (item.totalAmount || 0),
+            0
+          );
+          return acc + saleTotal;
+        }, 0);
+
+        res.json({ sales, totalAmount });
       } catch (err) {
-        console.error(err);
+        console.error("❌ Failed to fetch sales:", err);
         res.status(500).json({ message: "Failed to fetch sales" });
       }
     });
