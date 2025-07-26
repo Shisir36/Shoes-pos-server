@@ -64,6 +64,7 @@ async function run() {
           color,
           pricePerPair,
           quantitiesPerSize,
+          category, // 🆕 Accept category from frontend
         } = req.body;
 
         let insertedCount = 0;
@@ -78,6 +79,7 @@ async function run() {
           const price = Number(pricePerPair);
           const genericBarcode = `${brand}-${articleNumber || "NA"}-${sizeNum}`;
 
+          // Check if this shoe already exists
           const existing = await shoesCollection.findOne({
             shoeName,
             brand,
@@ -85,15 +87,18 @@ async function run() {
             color,
             size: sizeNum,
             pricePerPair: price,
+            category, // 🆕 include category in matching
           });
 
           if (existing) {
+            // If exists, update quantity
             await shoesCollection.updateOne(
               { _id: existing._id },
               { $inc: { quantity } }
             );
             updatedCount++;
           } else {
+            // If not, insert new
             await shoesCollection.insertOne({
               shoeName,
               brand,
@@ -102,12 +107,14 @@ async function run() {
               size: sizeNum,
               quantity,
               pricePerPair: price,
+              category, // 🆕 Save to DB
               barcode: genericBarcode,
               createdAt: new Date(),
             });
             insertedCount++;
           }
 
+          // Generate unique barcodes (for reference / printing / future logic)
           for (let i = 0; i < quantity; i++) {
             const timestamp = Date.now();
             addedShoes.push({
