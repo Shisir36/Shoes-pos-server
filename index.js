@@ -24,30 +24,63 @@ async function run() {
     await client.connect();
     const db = client.db("Shoes-shop-pos");
     const shoesCollection = db.collection("shoes");
-    const salesCollection = db.collection("sales"); // <==== declared here
-    // add user
+    const salesCollection = db.collection("sales");
+    const usersCollection = db.collection("users");
+    // Make sure you have access to your MongoDB 'users' collection.
+    // For example: const usersCollection = client.db("yourDbName").collection("users");
+
+    // --- POST a new user to the database (for Signup) ---
+    // This endpoint is called after a user successfully signs up via Firebase.
     app.post("/api/users", async (req, res) => {
-      const { name, email, photo, role } = req.body;
+      const newUser = req.body;
 
       try {
-        const existingUser = await db.collection("users").findOne({ email });
+        // Check if a user with this email already exists to prevent duplicates.
+        const existingUser = await usersCollection.findOne({
+          email: newUser.email,
+        });
         if (existingUser) {
-          return res.status(200).json({ message: "User already exists" });
+          return res.status(409).json({ message: "User already exists." });
         }
 
-        const result = await db.collection("users").insertOne({
-          name,
-          email,
-          photo,
-          role,
-          createdAt: new Date(),
-        });
+        // Set a default role for the new user.
+        // The first user to sign up can be made an admin manually
+        // or you can add logic here to make the first registered user an admin.
+        const userToInsert = {
+          ...newUser,
+          role: "user", // Default role for all new signups
+          createdAt: new Date(), // Track when the user was created
+        };
 
+        const result = await usersCollection.insertOne(userToInsert);
+        res.status(201).json(result);
+      } catch (err) {
+        console.error("Failed to create user:", err);
+        res.status(500).json({ message: "Server error while creating user." });
+      }
+    });
+
+    // --- GET a user by email (for Login) ---
+    // This endpoint is called after a user successfully signs in with Firebase
+    // to check their role for authorization.
+    app.get("/api/users/:email", async (req, res) => {
+      const { email } = req.params;
+
+      try {
+        const user = await usersCollection.findOne({ email: email });
+        if (!user) {
+          // This case might happen if a user exists in Firebase but not in your MongoDB.
+          return res
+            .status(404)
+            .json({ message: "User not found in database." });
+        }
+        // Return the user data, which includes the role.
+        res.status(200).json(user);
+      } catch (err) {
+        console.error("Failed to fetch user:", err);
         res
-          .status(201)
-          .json({ message: "User saved", insertedId: result.insertedId });
-      } catch (error) {
-        res.status(500).json({ error: "Something went wrong" });
+          .status(500)
+          .json({ message: "Server error while fetching user data." });
       }
     });
 
@@ -145,7 +178,7 @@ async function run() {
       try {
         const groupedShoes = await shoesCollection
           .aggregate([
-            { $sort: { createdAt: -1 } }, // Step 1: Sort by createdAt descending
+            { $sort: { createdAt: -1 } },
             {
               $group: {
                 _id: {
@@ -155,9 +188,10 @@ async function run() {
                   color: "$color",
                   size: "$size",
                   pricePerPair: "$pricePerPair",
+                  category: "$category", // <-- add this line
                 },
                 quantity: { $sum: "$quantity" },
-                createdAt: { $first: "$createdAt" }, // Save latest createdAt
+                createdAt: { $first: "$createdAt" },
                 anyId: { $first: "$_id" },
               },
             },
@@ -170,11 +204,12 @@ async function run() {
                 color: "$_id.color",
                 size: "$_id.size",
                 pricePerPair: "$_id.pricePerPair",
+                category: "$_id.category", // <-- add this line
                 quantity: 1,
                 createdAt: 1,
               },
             },
-            { $sort: { createdAt: -1 } }, // ✅ Step 2: Final sort after grouping
+            { $sort: { createdAt: -1 } },
           ])
           .toArray();
 
@@ -184,6 +219,7 @@ async function run() {
         res.status(500).json({ message: "Error fetching grouped stock" });
       }
     });
+
     app.get("/api/shoes/:id", async (req, res) => {
       const { id } = req.params;
       console.log(id);
@@ -220,7 +256,32 @@ async function run() {
         res.status(500).send({ error: "Update failed" });
       }
     });
+    // --- DELETE a shoe by its ID ---
+    // This endpoint handles the delete request from the frontend.
+    app.delete("/api/shoes/:id", async (req, res) => {
+      const { id } = req.params;
 
+      // Validate the ID to ensure it's a valid MongoDB ObjectId
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({ message: "Invalid shoe ID format" });
+      }
+
+      try {
+        const result = await shoesCollection.deleteOne({
+          _id: new ObjectId(id),
+        });
+
+        // Check if a document was actually deleted
+        if (result.deletedCount === 0) {
+          return res.status(404).json({ message: "Shoe not found" });
+        }
+
+        res.status(200).json({ message: "Shoe deleted successfully" });
+      } catch (err) {
+        console.error("Failed to delete shoe:", err);
+        res.status(500).json({ message: "Server error while deleting shoe" });
+      }
+    });
     // GET by barcode
     app.get("/api/shoes/barcode/:code", async (req, res) => {
       const baseBarcode = req.params.code.split("-").slice(0, 4).join("-");
