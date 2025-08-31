@@ -26,11 +26,6 @@ async function run() {
     const shoesCollection = db.collection("shoes");
     const salesCollection = db.collection("sales");
     const usersCollection = db.collection("users");
-    // Make sure you have access to your MongoDB 'users' collection.
-    // For example: const usersCollection = client.db("yourDbName").collection("users");
-
-    // --- POST a new user to the database (for Signup) ---
-    // This endpoint is called after a user successfully signs up via Firebase.
     app.post("/api/users", async (req, res) => {
       const newUser = req.body;
 
@@ -60,9 +55,6 @@ async function run() {
       }
     });
 
-    // --- GET a user by email (for Login) ---
-    // This endpoint is called after a user successfully signs in with Firebase
-    // to check their role for authorization.
     app.get("/api/users/:email", async (req, res) => {
       const { email } = req.params;
 
@@ -90,37 +82,45 @@ async function run() {
     // POST: Add Shoes
     app.post("/api/shoes/add", async (req, res) => {
       try {
+        // পরিবর্তিত: এখন inventory অ্যারে গ্রহণ করা হচ্ছে
         const {
           shoeName,
           brand,
           articleNumber,
-          color,
           pricePerPair,
-          quantitiesPerSize,
-          category, // 🆕 Accept category from frontend
+          inventory, // quantitiesPerSize এর পরিবর্তে inventory
+          category,
         } = req.body;
 
         let insertedCount = 0;
         let updatedCount = 0;
         const addedShoes = [];
 
-        for (const [size, qty] of Object.entries(quantitiesPerSize)) {
+        // পরিবর্তিত: inventory অ্যারের উপর লুপ চালানো হচ্ছে
+        for (const item of inventory) {
+          // প্রতিটি আইটেম থেকে size, quantity, এবং color নেওয়া হচ্ছে
+          const { size, quantity: qty, color } = item;
+
           const quantity = Number(qty);
           if (!quantity || isNaN(quantity) || quantity <= 0) continue;
 
           const sizeNum = Number(size);
           const price = Number(pricePerPair);
-          const genericBarcode = `${brand}-${articleNumber || "NA"}-${sizeNum}`;
+
+          // বারকোডে এখন color যোগ করা যেতে পারে, যা এটিকে আরও ইউনিক করে তুলবে
+          const genericBarcode = `${brand}-${
+            articleNumber || "NA"
+          }-${color}-${sizeNum}`;
 
           // Check if this shoe already exists
           const existing = await shoesCollection.findOne({
             shoeName,
             brand,
             articleNumber,
-            color,
+            color, // পরিবর্তিত: এখন প্রতিটি আইটেমের নিজস্ব color ব্যবহার হচ্ছে
             size: sizeNum,
             pricePerPair: price,
-            category, // 🆕 include category in matching
+            category,
           });
 
           if (existing) {
@@ -136,27 +136,28 @@ async function run() {
               shoeName,
               brand,
               articleNumber,
-              color,
+              color, // পরিবর্তিত: প্রতিটি আইটেমের নিজস্ব color সেভ হচ্ছে
               size: sizeNum,
               quantity,
               pricePerPair: price,
-              category, // 🆕 Save to DB
+              category,
               barcode: genericBarcode,
               createdAt: new Date(),
             });
             insertedCount++;
           }
 
-          // Generate unique barcodes (for reference / printing / future logic)
+          // Generate unique barcodes
           for (let i = 0; i < quantity; i++) {
             const timestamp = Date.now();
             addedShoes.push({
               brand,
               articleNumber,
+              color, // বারকোড লিস্টে color যোগ করা হলো
               size: sizeNum,
               barcode: `${brand}-${
                 articleNumber || "NA"
-              }-${sizeNum}-${timestamp}-${i}`,
+              }-${color}-${sizeNum}-${timestamp}-${i}`,
             });
           }
         }
@@ -172,7 +173,6 @@ async function run() {
         res.status(500).json({ message: "Server error" });
       }
     });
-
     // GET: Grouped Shoes stock
     app.get("/api/shoes", async (req, res) => {
       try {
